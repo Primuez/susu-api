@@ -334,16 +334,17 @@ describe('PATCH /api/v1/me', () => {
   });
 
   it('does not write a field the caller did not mention', async () => {
+    const validAvatar = `users/${USER_ID}/avatar/${'a'.repeat(32)}.webp`;
     const { app, readModel } = await harness();
     await app.inject({
       method: 'PATCH',
       url: '/api/v1/me',
       headers: AUTH,
-      payload: { avatarPath: 'users/abc/avatar/x.webp' },
+      payload: { avatarPath: validAvatar },
     });
 
     expect(readModel.updateProfile).toHaveBeenCalledWith(USER_ID, {
-      avatarPath: 'users/abc/avatar/x.webp',
+      avatarPath: validAvatar,
     });
   });
 
@@ -408,6 +409,65 @@ describe('PATCH /api/v1/me', () => {
     });
 
     expect(response.statusCode).toBe(400);
+  });
+
+  it('rejects an avatar path belonging to another user', async () => {
+    const { app, readModel } = await harness();
+    const response = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/me',
+      headers: AUTH,
+      payload: { avatarPath: `users/${OTHER_ID}/avatar/${'a'.repeat(32)}.webp` },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: 'invalid_request',
+      details: expect.arrayContaining([
+        expect.objectContaining({ path: 'avatarPath' }),
+      ]),
+    });
+    expect(readModel.updateProfile).not.toHaveBeenCalled();
+  });
+
+  it('rejects an avatar path with a non-hex or malformed filename', async () => {
+    const { app, readModel } = await harness();
+    const response = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/me',
+      headers: AUTH,
+      payload: { avatarPath: `users/${USER_ID}/avatar/x.webp` },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: 'invalid_request',
+      details: expect.arrayContaining([
+        expect.objectContaining({ path: 'avatarPath' }),
+      ]),
+    });
+    expect(readModel.updateProfile).not.toHaveBeenCalled();
+  });
+
+  it('handles database check constraint violation as 400 invalid_request', async () => {
+    const { app, readModel } = await harness();
+    const dbError = new Error('check violation');
+    (dbError as unknown as { code: string }).code = '23514';
+    readModel.updateProfile.mockRejectedValueOnce(dbError);
+
+    const validAvatar = `users/${USER_ID}/avatar/${'a'.repeat(32)}.webp`;
+    const response = await app.inject({
+      method: 'PATCH',
+      url: '/api/v1/me',
+      headers: AUTH,
+      payload: { avatarPath: validAvatar },
+    });
+
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toEqual({
+      error: 'invalid_request',
+      details: [{ path: 'avatarPath', message: 'violates avatar path constraint' }],
+    });
   });
 });
 
