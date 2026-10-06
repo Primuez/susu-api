@@ -80,100 +80,107 @@ export type RegistrationStore = {
 };
 
 export function createRegistrationStore(db: Database): RegistrationStore {
-  async function countLive(userId: string): Promise<number> {
-    const rows = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(groupRegistrations)
-      .where(
-        and(
-          eq(groupRegistrations.registeredBy, userId),
-          gt(groupRegistrations.expiresAt, sql`now()`),
-        ),
-      );
-
-    return rows[0]?.count ?? 0;
-  }
-
   return {
     async register({ contractId, userId }) {
-      // Expired rows for this account are removed first. They answer nothing —
-      // `isRegistered` would ignore them — so leaving them would only accumulate
-      // rows and, worse, count against the cap that is meant to measure live
-      // claims. Cleaning up the account's own rows keeps that bounded without a
-      // background job.
-      await db
-        .delete(groupRegistrations)
-        .where(
-          and(
-            eq(groupRegistrations.registeredBy, userId),
-            lte(groupRegistrations.expiresAt, sql`now()`),
-          ),
+      return db.transaction(async (tx) => {
+        // Enforce the cap atomically: an advisory xact lock keyed to the user serializes
+        // registration attempts for this account for the duration of the transaction.
+        // Parallel requests from different accounts run concurrently without blocking.
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtext('group_registrations'), hashtext(${userId}))`,
         );
 
-      const expiresAt = new Date(Date.now() + REGISTRATION_TTL_MS);
-
-      // The cap is checked against the claim being *replaced*, so re-registering
-      // an address an account already holds is never refused for being at the
-      // limit — otherwise the one case that should always work would fail.
-      const existing = await db
-        .select({ registeredBy: groupRegistrations.registeredBy })
-        .from(groupRegistrations)
-        .where(eq(groupRegistrations.contractId, contractId));
-
-      const alreadyMine = existing[0]?.registeredBy === userId;
-      if (!alreadyMine && (await countLive(userId)) >= MAX_LIVE_REGISTRATIONS) {
-        return { outcome: 'too_many' } as const;
-      }
-
-      if (alreadyMine) {
-        const updated = await db
-          .update(groupRegistrations)
-          .set({ expiresAt })
+        // Expired rows for this account are removed first. They answer nothing —
+        // `isRegistered` would ignore them — so leaving them would only accumulate
+        // rows and, worse, count against the cap that is meant to measure live
+        // claims. Cleaning up the account's own rows keeps that bounded without a
+        // background job.
+        await tx
+          .delete(groupRegistrations)
           .where(
             and(
-              eq(groupRegistrations.contractId, contractId),
-              // Belt and braces against a concurrent claim by another account
-              // between the read above and this write: the update matches nothing
-              // rather than transferring the row.
               eq(groupRegistrations.registeredBy, userId),
+              lte(groupRegistrations.expiresAt, sql`now()`),
             ),
-          )
+          );
+
+        const expiresAt = new Date(Date.now() + REGISTRATION_TTL_MS);
+
+        // The cap is checked against the claim being *replaced*, so re-registering
+        // an address an account already holds is never refused for being at the
+        // limit — otherwise the one case that should always work would fail.
+        const existing = await tx
+          .select({ registeredBy: groupRegistrations.registeredBy })
+          .from(groupRegistrations)
+          .where(eq(groupRegistrations.contractId, contractId));
+
+        const alreadyMine = existing[0]?.registeredBy === userId;
+        if (!alreadyMine) {
+          const live = await tx
+            .select({ count: sql<number>`count(*)::int` })
+            .from(groupRegistrations)
+            .where(
+              and(
+                eq(groupRegistrations.registeredBy, userId),
+                gt(groupRegistrations.expiresAt, sql`now()`),
+              ),
+            );
+
+          if ((live[0]?.count ?? 0) >= MAX_LIVE_REGISTRATIONS) {
+            return { outcome: 'too_many' } as const;
+          }
+        }
+
+        if (alreadyMine) {
+          const updated = await tx
+            .update(groupRegistrations)
+            .set({ expiresAt })
+            .where(
+              and(
+                eq(groupRegistrations.contractId, contractId),
+                // Belt and braces against a concurrent claim by another account
+                // between the read above and this write: the update matches nothing
+                // rather than transferring the row.
+                eq(groupRegistrations.registeredBy, userId),
+              ),
+            )
+            .returning({ expiresAt: groupRegistrations.expiresAt });
+
+          return {
+            outcome: 'registered',
+            contractId,
+            expiresAt: (updated[0]?.expiresAt ?? expiresAt).toISOString(),
+          } as const;
+        }
+
+        // Another account's claim, or none. `onConflictDoNothing` makes the insert
+        // safe either way: if the address is already claimed, nothing changes — the
+        // existing holder keeps it and this account learns it is registered.
+        const inserted = await tx
+          .insert(groupRegistrations)
+          .values({ contractId, registeredBy: userId, expiresAt })
+          .onConflictDoNothing({ target: groupRegistrations.contractId })
           .returning({ expiresAt: groupRegistrations.expiresAt });
 
+        if (inserted[0] !== undefined) {
+          return {
+            outcome: 'registered',
+            contractId,
+            expiresAt: inserted[0].expiresAt.toISOString(),
+          } as const;
+        }
+
+        const holder = await tx
+          .select({ expiresAt: groupRegistrations.expiresAt })
+          .from(groupRegistrations)
+          .where(eq(groupRegistrations.contractId, contractId));
+
         return {
           outcome: 'registered',
           contractId,
-          expiresAt: (updated[0]?.expiresAt ?? expiresAt).toISOString(),
+          expiresAt: (holder[0]?.expiresAt ?? expiresAt).toISOString(),
         } as const;
-      }
-
-      // Another account's claim, or none. `onConflictDoNothing` makes the insert
-      // safe either way: if the address is already claimed, nothing changes — the
-      // existing holder keeps it and this account learns it is registered.
-      const inserted = await db
-        .insert(groupRegistrations)
-        .values({ contractId, registeredBy: userId, expiresAt })
-        .onConflictDoNothing({ target: groupRegistrations.contractId })
-        .returning({ expiresAt: groupRegistrations.expiresAt });
-
-      if (inserted[0] !== undefined) {
-        return {
-          outcome: 'registered',
-          contractId,
-          expiresAt: inserted[0].expiresAt.toISOString(),
-        } as const;
-      }
-
-      const holder = await db
-        .select({ expiresAt: groupRegistrations.expiresAt })
-        .from(groupRegistrations)
-        .where(eq(groupRegistrations.contractId, contractId));
-
-      return {
-        outcome: 'registered',
-        contractId,
-        expiresAt: (holder[0]?.expiresAt ?? expiresAt).toISOString(),
-      } as const;
+      });
     },
 
     async isRegistered(contractId) {
