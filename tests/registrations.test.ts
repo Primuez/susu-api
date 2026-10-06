@@ -191,4 +191,34 @@ describe('createRegistrationStore.register', () => {
     const result = await store.register({ contractId, userId: USER_ONE });
     expect(result.outcome).toBe('registered');
   });
+
+  it('enforces the cap atomically under concurrent registrations racing at the limit', async () => {
+    // Fill the account up to one below the maximum cap
+    for (let index = 0; index < MAX_LIVE_REGISTRATIONS - 1; index += 1) {
+      const result = await store.register({
+        contractId: distinctContractId(index),
+        userId: USER_ONE,
+      });
+      expect(result.outcome).toBe('registered');
+    }
+
+    // Two parallel registrations from the same user racing for the remaining slot
+    const [resultA, resultB] = await Promise.all([
+      store.register({
+        contractId: distinctContractId(MAX_LIVE_REGISTRATIONS - 1),
+        userId: USER_ONE,
+      }),
+      store.register({ contractId: distinctContractId(MAX_LIVE_REGISTRATIONS), userId: USER_ONE }),
+    ]);
+
+    const outcomes = [resultA.outcome, resultB.outcome].sort();
+    expect(outcomes).toEqual(['registered', 'too_many']);
+
+    // Exactly MAX_LIVE_REGISTRATIONS rows in Postgres, never exceeding the cap
+    const rows = await testDb.query(
+      'select count(*)::int as count from public.group_registrations where registered_by = $1 and expires_at > now()',
+      [USER_ONE],
+    );
+    expect(rows.rows[0]?.['count']).toBe(MAX_LIVE_REGISTRATIONS);
+  });
 });
